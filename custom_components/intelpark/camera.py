@@ -1,10 +1,12 @@
 """Камеры Intelpark (HLS-поток + снимок)."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
 from homeassistant.components.camera import Camera as HACamera, CameraEntityFeature
+from homeassistant.components.camera.helper import async_get_stream_image
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -14,6 +16,9 @@ from .coordinator import IntelparkConfigEntry, IntelparkCoordinator
 from .entity import gate_device_info, object_device_info, strip_number_sign
 
 _LOGGER = logging.getLogger(__name__)
+
+# Оставляем время на получение кадра из потока при сбое снимка.
+GATE_SNAPSHOT_TIMEOUT = 3
 
 
 async def async_setup_entry(
@@ -123,7 +128,9 @@ class IntelparkGateCamera(HACamera):
 
     @property
     def use_stream_for_stills(self) -> bool:
-        return True
+        # Не запускаем HLS/go2rtc только ради превью, если доступен снимок.
+        gate = self._gate
+        return gate is None or not bool(gate.snapshot_image)
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -142,14 +149,22 @@ class IntelparkGateCamera(HACamera):
         if gate is None or not gate.snapshot_image:
             return None
         try:
-            return await self.coordinator.client.async_fetch_snapshot(
-                gate.snapshot_image
-            )
-        except IntelparkError as err:
+            async with asyncio.timeout(GATE_SNAPSHOT_TIMEOUT):
+                image = await self.coordinator.client.async_fetch_snapshot(
+                    gate.snapshot_image
+                )
+            if image:
+                return image
+            _LOGGER.warning("Пустой снимок ворот %s", self._gid)
+        except (IntelparkError, TimeoutError) as err:
             _LOGGER.warning(
                 "Не удалось получить снимок ворот %s: %s", self._gid, err
             )
+        if self._gate is None:
             return None
+        return await async_get_stream_image(
+            self, width=width, height=height, wait_for_next_keyframe=False
+        )
 
     @property
     def extra_state_attributes(self) -> dict:

@@ -5,21 +5,31 @@ import asyncio
 import logging
 import time
 
-from homeassistant.components.camera import Camera as HACamera, CameraEntityFeature
+from homeassistant.components.camera import Camera as HACamera
+from homeassistant.components.camera import CameraEntityFeature
 from homeassistant.components.camera.helper import async_get_stream_image
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .api import Camera, Gate, IntelparkError
-from .const import DOMAIN, TOKEN_REFRESH_MARGIN
+from .const import (
+    CONF_GATE_PREVIEW_SOURCE,
+    DOMAIN,
+    PREVIEW_SOURCE_SNAPSHOT,
+    TOKEN_REFRESH_MARGIN,
+)
 from .coordinator import IntelparkConfigEntry, IntelparkCoordinator
 from .entity import gate_device_info, object_device_info, strip_number_sign
 
 _LOGGER = logging.getLogger(__name__)
 
-# Leave time for a stream frame within HA's default image request timeout.
+# Bound card-driven snapshot attempts within HA's image request timeout.
 GATE_SNAPSHOT_TIMEOUT = 3
 GATE_SNAPSHOT_COOLDOWN = 60
+GATE_SNAPSHOT_ATTEMPTS = 2
+GATE_SNAPSHOT_FAILED_CYCLES = 3
+GATE_SNAPSHOT_STALE_WARNING = 300
+GATE_SNAPSHOT_REQUEST_GAP = 120
 
 
 async def async_setup_entry(
@@ -120,6 +130,16 @@ class IntelparkGateCamera(HACamera):
         self._attr_device_info = gate_device_info(
             coordinator.config_entry.entry_id, gate
         )
+        # Capture the option for this entity lifetime; updates reload the entry.
+        self._snapshot_previews = (
+            coordinator.config_entry.options.get(CONF_GATE_PREVIEW_SOURCE)
+            == PREVIEW_SOURCE_SNAPSHOT
+        )
+        self._last_snapshot: bytes | None = None
+        self._last_snapshot_at: float | None = None
+        self._snapshot_outage_since: float | None = None
+        self._snapshot_last_request: float | None = None
+        self._snapshot_warned = False
         self._snapshot_lock = asyncio.Lock()
         self._snapshot_failures = 0
         self._snapshot_open_until = 0.0
@@ -135,9 +155,8 @@ class IntelparkGateCamera(HACamera):
 
     @property
     def use_stream_for_stills(self) -> bool:
-        # Prefer snapshots without starting HLS/go2rtc just for a preview.
-        gate = self._gate
-        return gate is None or not bool(gate.snapshot_image)
+        # Snapshot mode never falls back to stream, even without snapshotURL.
+        return not self._snapshot_previews
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -161,7 +180,7 @@ class IntelparkGateCamera(HACamera):
         await super().async_will_remove_from_hass()
 
     def _image_done(self, key, entry, task) -> None:
-        # Identity checks protect a newer request with the same dimensions.
+        # Identity checks protect newer work using the same canonical key.
         if self._image_inflight.get(key) is entry:
             del self._image_inflight[key]
         self._image_tasks.discard(task)
@@ -171,10 +190,11 @@ class IntelparkGateCamera(HACamera):
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        """Share concurrent work only; never retain a completed image."""
-        if self._image_removing:
+        """Coalesce active requests; keep the last-good image separately in RAM."""
+        if self._image_removing or self._gate is None:
             return None
-        key = (width, height)
+        # Server snapshots ignore dimensions; stream helpers must preserve them.
+        key = (None, None) if self._snapshot_previews else (width, height)
         entry = self._image_inflight.get(key)
         if entry is None or entry[0].done():
             task = asyncio.create_task(self._async_camera_image(width, height))
@@ -201,89 +221,93 @@ class IntelparkGateCamera(HACamera):
     async def _async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        snapshot_started = time.monotonic()
-        snapshot_failure = "circuit_open"
-        # Serialize snapshot decisions across dimensions, not stream fallback.
-        # This also prevents duplicate half-open probes and stale completions
-        # overwriting a newer circuit state. No lock spans the fallback helper.
-        async with self._snapshot_lock:
-            gate = self._gate
-            if self._image_removing or gate is None or not gate.snapshot_image:
-                return None
-            if time.monotonic() >= self._snapshot_open_until:
-                probe = self._snapshot_open_until > 0
-                snapshot_failure = "empty"
-                try:
-                    async with asyncio.timeout(GATE_SNAPSHOT_TIMEOUT):
-                        image = await self.coordinator.client.async_fetch_snapshot(
-                            gate.snapshot_image
-                        )
-                    if image:
-                        self._snapshot_failures = 0
-                        self._snapshot_open_until = 0.0
-                        if probe:
-                            _LOGGER.warning(
-                                "Gate image gate=%s snapshot=probe-recovered",
-                                self.entity_id,
-                            )
-                        return image
-                except (IntelparkError, TimeoutError) as err:
-                    # No upstream exception text or URL in diagnostic records.
-                    snapshot_failure = (
-                        "timeout" if isinstance(err, TimeoutError) else "intelpark_error"
-                    )
-                self._snapshot_failures = min(self._snapshot_failures + 1, 2)
-                if probe or self._snapshot_failures >= 2:
-                    self._snapshot_open_until = (
-                        time.monotonic() + GATE_SNAPSHOT_COOLDOWN
-                    )
-                    _LOGGER.warning(
-                        "Gate image gate=%s snapshot=circuit-open cooldown_s=%s "
-                        "reason=%s probe=%s",
-                        self.entity_id, GATE_SNAPSHOT_COOLDOWN,
-                        snapshot_failure, probe,
-                    )
-        snapshot_ms = (time.monotonic() - snapshot_started) * 1000
-        if self._gate is None:
-            return None
-        request = getattr(self, "_snapshot_diag_request", 0) + 1
-        self._snapshot_diag_request = request
-        fallback_started = time.monotonic()
-        result = "exception"
-        try:
-            image = await async_get_stream_image(
+        if not self._snapshot_previews:
+            return await async_get_stream_image(
                 self, width=width, height=height, wait_for_next_keyframe=False
             )
-            result = "image" if image else "none"
-            return image
-        except asyncio.CancelledError:
-            result = "cancelled"
-            raise
-        finally:
-            finished = time.monotonic()
-            # Defer the pair until the outcome is known. Each outcome category
-            # gets its own cooldown, so a new failure is not hidden by success.
-            # At most 4 snapshot reasons x 4 fallback outcomes; no URL/ID keys.
-            diagnostics = getattr(self, "_snapshot_diag_outcomes", None)
-            if diagnostics is None:
-                diagnostics = self._snapshot_diag_outcomes = {}
-            key = (snapshot_failure, result)
-            last, suppressed = diagnostics.get(key, (float("-inf"), 0))
-            if finished - last >= 60:
-                diagnostics[key] = (finished, 0)
-                _LOGGER.warning(
-                    "Gate image gate=%s request=%s snapshot_failure=%s "
-                    "snapshot_ms=%.1f fallback=start deferred=true suppressed=%s",
-                    self.entity_id, request, snapshot_failure, snapshot_ms, suppressed,
-                )
-                _LOGGER.warning(
-                    "Gate image gate=%s request=%s fallback=result result=%s "
-                    "fallback_ms=%.1f",
-                    self.entity_id, request, result,
-                    (finished - fallback_started) * 1000,
-                )
-            else:
-                diagnostics[key] = (last, suppressed + 1)
+        # Across dimensions the server supplies the same native-size image.
+        # Serialize fetch/cache updates so old tasks cannot overwrite new data.
+        async with self._snapshot_lock:
+            gate = self._gate
+            if self._image_removing or gate is None:
+                return None
+            now = time.monotonic()
+            # No warning merely because a card was closed. A long request gap
+            # starts a new observation window, even for an existing outage.
+            if (
+                self._snapshot_last_request is not None
+                and now - self._snapshot_last_request > GATE_SNAPSHOT_REQUEST_GAP
+            ):
+                self._snapshot_outage_since = None
+                # Retain warned until recovery: at most one warning per outage.
+            self._snapshot_last_request = now
+            if now < self._snapshot_open_until:
+                self._snapshot_failed("cooldown", now)
+                return self._last_snapshot
+            reason = "missing_url"
+            image = None
+            if gate.snapshot_image:
+                # One shared card cycle: at most two bounded attempts, no sleep.
+                for _ in range(GATE_SNAPSHOT_ATTEMPTS):
+                    reason = "empty"
+                    try:
+                        async with asyncio.timeout(GATE_SNAPSHOT_TIMEOUT):
+                            image = await self.coordinator.client.async_fetch_snapshot(
+                                gate.snapshot_image
+                            )
+                    except (IntelparkError, TimeoutError) as err:
+                        reason = (
+                            "timeout" if isinstance(err, TimeoutError) else "intelpark_error"
+                        )
+                    if image:
+                        break
+            if self._image_removing or self._gate is None:
+                return None
+            now = time.monotonic()
+            if image:
+                self._snapshot_failures = 0
+                self._snapshot_open_until = 0.0
+                self._last_snapshot = image
+                # Successful fetch time, not a claim about camera capture time.
+                self._last_snapshot_at = now
+                if self._snapshot_warned:
+                    _LOGGER.info("Gate snapshot gate=%s recovered", self.entity_id)
+                self._snapshot_outage_since = None
+                self._snapshot_warned = False
+                return image
+            self._snapshot_failures = min(
+                self._snapshot_failures + 1, GATE_SNAPSHOT_FAILED_CYCLES
+            )
+            if self._snapshot_failures >= GATE_SNAPSHOT_FAILED_CYCLES:
+                self._snapshot_open_until = now + GATE_SNAPSHOT_COOLDOWN
+            self._snapshot_failed(reason, now)
+            return self._last_snapshot
+
+    def _snapshot_failed(self, reason: str, now: float) -> None:
+        """One sanitized debug, one sustained-outage warning, then recovery."""
+        if self._snapshot_outage_since is None:
+            self._snapshot_outage_since = now
+            _LOGGER.debug(
+                "Gate snapshot gate=%s snapshot_failure=%s", self.entity_id, reason
+            )
+        # No timer and no age-only alarm after idle. Both the observed failure
+        # period and last-fetched data age must reach the five-minute threshold.
+        stale_since = self._last_snapshot_at
+        if (
+            not self._snapshot_warned
+            and now - self._snapshot_outage_since >= GATE_SNAPSHOT_STALE_WARNING
+            and (
+                stale_since is None
+                or now - stale_since >= GATE_SNAPSHOT_STALE_WARNING
+            )
+        ):
+            self._snapshot_warned = True
+            _LOGGER.warning(
+                "Gate snapshot gate=%s unavailable_for_s=%s cached=%s",
+                self.entity_id,
+                GATE_SNAPSHOT_STALE_WARNING,
+                self._last_snapshot is not None,
+            )
 
     @property
     def extra_state_attributes(self) -> dict:
